@@ -86,6 +86,16 @@ add_header_to_current_table(void* cls,
 }
 
 enum MHD_Result
+http_error(struct MHD_Connection* connection, int code, const char* body)
+{
+    struct MHD_Response* response = MHD_create_response_from_buffer(
+      strlen(body), (void*)body, MHD_RESPMEM_PERSISTENT);
+    enum MHD_Result retval = MHD_queue_response(connection, code, response);
+    MHD_destroy_response(response);
+    return retval;
+}
+
+enum MHD_Result
 http_answer(void* cls,
             struct MHD_Connection* connection,
             const char* url,
@@ -98,6 +108,10 @@ http_answer(void* cls,
     UNUSED(cls);
     UNUSED(req_cls);
     UNUSED(upload_data_size);
+
+    // TODO: enum-ify this
+    const char* e404 = "<html>404 Route not found</html>";
+    const char* e500 = "<html>500 Internal Server Error</html>";
 
     printf("%s %s %s\n", version, method, url);
 
@@ -113,12 +127,9 @@ http_answer(void* cls,
     lua_gettable(L, -2);
 
     if (!lua_isfunction(L, -1)) {
-        const char* e404 = "<html>404 Route not found</html>";
-        response = MHD_create_response_from_buffer(
-          strlen(e404), (void*)e404, MHD_RESPMEM_PERSISTENT);
-        retval = MHD_queue_response(connection, MHD_HTTP_NOT_FOUND, response);
-        MHD_destroy_response(response);
-        return retval;
+        retval = http_error(connection, MHD_HTTP_NOT_FOUND, e404);
+        lua_pop(L, 1);
+        goto http_response_lua_unlock;
     }
 
     // stack: [routes, handler_fn]
@@ -139,31 +150,76 @@ http_answer(void* cls,
     lua_settable(L, -3);
 
     /* request.body */
-    // stack: [routes, handler_fn, request]
 
     lua_pushstring(L, "body");
     lua_pushstring(L, upload_data);
-    // request["body"] = upload_data
     lua_settable(L, -3);
 
-    if (lua_pcall(L, 1, 2, 0) != LUA_OK) { // handler_fn(request) -> 2 ret-vals.
+    /* request.method */
+
+    lua_pushstring(L, "method");
+    lua_pushstring(L, method);
+    lua_settable(L, -3);
+
+    /* request.url */
+
+    lua_pushstring(L, "url");
+    lua_pushstring(L, url);
+    lua_settable(L, -3);
+
+    // stack: [routes, handler_fn, request]
+
+    // handler_fn(request) -> {status: number, body: string}
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
         fprintf(
           stderr, "Lua error in handler function: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
-
-        const char* e500 = "<html>500 Internal Server Error</html>";
-        response = MHD_create_response_from_buffer(
-          strlen(e500), (void*)e500, MHD_RESPMEM_PERSISTENT);
-        retval = MHD_queue_response(
-          connection, MHD_HTTP_INTERNAL_SERVER_ERROR, response);
-        MHD_destroy_response(response);
-        return retval;
+        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        goto http_response_lua_unlock;
     }
 
-    // stack: [routes, status_code, body_string]
+    // stack: [routes, response]
 
-    int status = lua_tointeger(L, -2);
+    if (!lua_istable(L, -1)) {
+        fprintf(stderr,
+                "Invalid handler return value - expected table, got %s\n",
+                lua_typename(L, lua_type(L, -1)));
+        lua_pop(L, 1);
+        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        goto http_response_lua_unlock;
+    }
+
+    lua_getfield(L, -1, "code");
+
+    if (!lua_isinteger(L, -1)) {
+        fprintf(stderr,
+                "Invalid response 'code' field - expected integer, got %s\n",
+                lua_typename(L, lua_type(L, -1)));
+        lua_pop(L, 2);
+        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        goto http_response_lua_unlock;
+    }
+
+    int status = lua_tointeger(L, -1);
+    lua_pop(L, 1);
+
+    // stack: [routes, response]
+
+    lua_getfield(L, -1, "body");
+
+    if (!lua_isstring(L, -1)) {
+        fprintf(stderr,
+                "Invalid response 'body' field - expected string, got %s\n",
+                lua_typename(L, lua_type(L, -1)));
+        lua_pop(L, 2);
+        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        goto http_response_lua_unlock;
+    }
+
     const char* body = lua_tostring(L, -1);
+    lua_pop(L, 1);
+
+    // stack: [routes, response]
 
     response = MHD_create_response_from_buffer(
       strlen(body), (void*)body, MHD_RESPMEM_PERSISTENT);
@@ -173,10 +229,11 @@ http_answer(void* cls,
     retval = MHD_queue_response(connection, status, response);
     MHD_destroy_response(response);
 
-    lua_pop(L, 2);
+    lua_pop(L, 1);
 
     // stack: [routes]
 
+http_response_lua_unlock:
     pthread_mutex_unlock(&luaLock);
 
     return retval;
@@ -341,7 +398,7 @@ main(int argc, char* argv[])
     }
 
     struct MHD_Daemon* http_daemon =
-      MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD,
+      MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION,
                        HTTP_PORT,
                        &http_on_client_connect,
                        NULL,
