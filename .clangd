@@ -1,0 +1,17 @@
+CompileFlags:
+  Add:
+    [
+      "-g",
+      "-Os",
+      "-Wall",
+      "-Wextra",
+      "-fpermissive",
+      "-fno-exceptions",
+      "-fno-threadsafe-statics",
+      "-ffunction-sections",
+      "-fdata-sections",
+      "-pipe",
+      "-std=gnu99",
+      "-x", "c",
+    ]
+  Compiler: gcc
