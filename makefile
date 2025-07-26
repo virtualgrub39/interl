@@ -1,5 +1,5 @@
 CFLAGS  = -Wall -Wextra -std=gnu23
-LDFLAGS = -lm -llua -lmicrohttpd
+LDFLAGS = -lm -llua -lmicrohttpd -lpthread
 
 cc := gcc
 

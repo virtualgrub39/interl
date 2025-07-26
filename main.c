@@ -1,11 +1,13 @@
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,7 +24,12 @@
 #include "config.h"
 #include "ketopt.h"
 
+struct watch_args {
+    const char* path;
+};
+
 static lua_State* L = NULL;
+pthread_mutex_t luaLock = PTHREAD_MUTEX_INITIALIZER;
 
 #define runtime_assert(condition)                                              \
     if (!(condition)) {                                                        \
@@ -38,31 +45,6 @@ static lua_State* L = NULL;
         abort();                                                               \
     } while (0)
 #define UNUSED(arg) ((void)arg)
-
-// double
-// f(double x)
-// {
-//     double y = 0.0;
-
-//     lua_rawgeti(L, LUA_REGISTRYINDEX, ref_f);
-//     lua_pushnumber(L, x);
-
-//     if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-//         fprintf(stderr, "Lua error in f(): %s\n", lua_tostring(L, -1));
-//         lua_pop(L, 1);
-//         return -1.0;
-//     }
-
-//     if (!lua_isnumber(L, -1)) {
-//         fprintf(stderr, "Lua f() didn’t return a number\n");
-//         lua_pop(L, 1);
-//         return -1.0;
-//     }
-
-//     y = lua_tonumber(L, -1);
-//     lua_pop(L, 1);
-//     return y;
-// }
 
 enum MHD_Result
 http_on_client_connect(void* cls,
@@ -124,9 +106,11 @@ http_answer(void* cls,
 
     // stack: [routes]
 
+    pthread_mutex_lock(&luaLock);
+
     // routes[url]
     lua_pushstring(L, url);
-    lua_gettable(L, -2); // TODO: Why -2?
+    lua_gettable(L, -2);
 
     if (!lua_isfunction(L, -1)) {
         const char* e404 = "<html>404 Route not found</html>";
@@ -162,9 +146,9 @@ http_answer(void* cls,
     // request["body"] = upload_data
     lua_settable(L, -3);
 
-
     if (lua_pcall(L, 1, 2, 0) != LUA_OK) { // handler_fn(request) -> 2 ret-vals.
-        fprintf(stderr, "Lua error in handler function: %s\n", lua_tostring(L, -1));
+        fprintf(
+          stderr, "Lua error in handler function: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
 
         const char* e500 = "<html>500 Internal Server Error</html>";
@@ -193,7 +177,72 @@ http_answer(void* cls,
 
     // stack: [routes]
 
+    pthread_mutex_unlock(&luaLock);
+
     return retval;
+}
+
+static void
+reload_lua(lua_State* L, const char* path)
+{
+    lua_settop(L, 0);
+
+    if (luaL_dofile(L, path) != LUA_OK) {
+        fprintf(stderr, "Error reloading Lua: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return;
+    }
+
+    lua_getglobal(L, "routes");
+    if (!lua_istable(L, -1)) {
+        fprintf(stderr, "`routes` is not a table!\n");
+    }
+}
+
+static void*
+watcher_thread(void* arg)
+{
+    struct watch_args* wa = arg;
+    int in_fd = inotify_init1(IN_NONBLOCK);
+    if (in_fd < 0) {
+        perror("inotify_init1");
+        return NULL;
+    }
+
+    // Watch for writes + close (so temporary files don’t trigger)
+    int wd = inotify_add_watch(in_fd, wa->path, IN_CLOSE_WRITE);
+    if (wd < 0) {
+        perror("inotify_add_watch");
+        close(in_fd);
+        return NULL;
+    }
+
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    while (1) {
+        ssize_t len = read(in_fd, buf, sizeof(buf));
+        if (len <= 0) {
+            // EAGAIN if nothing to read; sleep briefly
+            usleep(200000);
+            continue;
+        }
+
+        for (char* ptr = buf; ptr < buf + len;) {
+            struct inotify_event* evt = (void*)ptr;
+            if (evt->mask & IN_CLOSE_WRITE) {
+                // File was updated—reload
+                printf("%s updated - reloading...\n", wa->path);
+                pthread_mutex_lock(&luaLock);
+                reload_lua(L, wa->path);
+                pthread_mutex_unlock(&luaLock);
+            }
+            ptr += sizeof(*evt) + evt->len;
+        }
+    }
+
+    // (never reached)
+    inotify_rm_watch(in_fd, wd);
+    close(in_fd);
+    return NULL;
 }
 
 static void
@@ -237,14 +286,6 @@ main(int argc, char* argv[])
             case ko_help:
                 usage(argv[0]);
                 return 0;
-                // errno = 0;
-                // char* end;
-                // unsigned long v = strtoul(s.arg, &end, 10);
-                // if (errno || *end != '\0') {
-                //     fprintf(stderr, "Invalid table length: %s\n", s.arg);
-                //     usage(argv[0]);
-                //     return 1;
-                // }
 
             case 'f':
             case ko_file:
@@ -285,16 +326,17 @@ main(int argc, char* argv[])
 
     luaL_openlibs(L);
 
-    if (luaL_dofile(L, lua_file)) {
-        fprintf(stderr, "Failed to load script: %s\n", lua_tostring(L, -1));
-        lua_close(L);
-        return 1;
-    }
+    pthread_mutex_lock(&luaLock);
+    reload_lua(L, lua_file);
+    pthread_mutex_unlock(&luaLock);
 
-    lua_getglobal(L, "routes");
-    if (!lua_istable(L, -1)) {
-        fprintf(stderr, "Lua script must define `routes` table.\n");
-        lua_close(L);
+    pthread_t tid;
+    struct watch_args wa = {
+        .path = lua_file,
+    };
+
+    if (pthread_create(&tid, NULL, watcher_thread, &wa) != 0) {
+        perror("pthread_create");
         return 1;
     }
 
