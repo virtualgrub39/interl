@@ -164,7 +164,7 @@ http_answer(void* cls,
 
 
     if (lua_pcall(L, 1, 2, 0) != LUA_OK) { // handler_fn(request) -> 2 ret-vals.
-        fprintf(stderr, "Lua error in f(): %s\n", lua_tostring(L, -1));
+        fprintf(stderr, "Lua error in handler function: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
 
         const char* e500 = "<html>500 Internal Server Error</html>";
