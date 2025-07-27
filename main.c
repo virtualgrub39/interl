@@ -1,15 +1,9 @@
-#include <errno.h>
-#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
-#include <time.h>
-#include <unistd.h>
 
 #include <arpa/inet.h>
 #include <microhttpd.h>
@@ -20,12 +14,16 @@
 #include <lauxlib.h>
 #include <lua.h>
 #include <lualib.h>
+#include <time.h>
+// #include <sys/time.h>
 
-#include "config.h"
 #include "ketopt.h"
 
-struct watch_args {
-    const char* path;
+#include "config.h"
+
+struct server_cfg {
+    const char* lua_cfg_path;
+    const char* static_dir_path;
 };
 
 static lua_State* L = NULL;
@@ -90,6 +88,7 @@ http_error(struct MHD_Connection* connection, int code, const char* body)
 {
     struct MHD_Response* response = MHD_create_response_from_buffer(
       strlen(body), (void*)body, MHD_RESPMEM_PERSISTENT);
+    MHD_add_response_header(response, MHD_HTTP_HEADER_CONTENT_TYPE, "text");
     enum MHD_Result retval = MHD_queue_response(connection, code, response);
     MHD_destroy_response(response);
     return retval;
@@ -109,10 +108,6 @@ http_answer(void* cls,
     UNUSED(req_cls);
     UNUSED(upload_data_size);
 
-    // TODO: enum-ify this
-    const char* e404 = "<html>404 Route not found</html>";
-    const char* e500 = "<html>500 Internal Server Error</html>";
-
     printf("%s %s %s\n", version, method, url);
 
     struct MHD_Response* response = NULL;
@@ -127,7 +122,7 @@ http_answer(void* cls,
     lua_gettable(L, -2);
 
     if (!lua_isfunction(L, -1)) {
-        retval = http_error(connection, MHD_HTTP_NOT_FOUND, e404);
+        retval = http_error(connection, MHD_HTTP_NOT_FOUND, "Route not found");
         lua_pop(L, 1);
         goto http_response_lua_unlock;
     }
@@ -167,6 +162,9 @@ http_answer(void* cls,
     lua_pushstring(L, url);
     lua_settable(L, -3);
 
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     // stack: [routes, handler_fn, request]
 
     // handler_fn(request) -> {status: number, body: string}
@@ -174,9 +172,15 @@ http_answer(void* cls,
         fprintf(
           stderr, "Lua error in handler function: %s\n", lua_tostring(L, -1));
         lua_pop(L, 1);
-        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        retval = http_error(
+          connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error");
         goto http_response_lua_unlock;
     }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) +
+                    (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("Lua returned in %.9fs\n", elapsed);
 
     // stack: [routes, response]
 
@@ -185,7 +189,8 @@ http_answer(void* cls,
                 "Invalid handler return value - expected table, got %s\n",
                 lua_typename(L, lua_type(L, -1)));
         lua_pop(L, 1);
-        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        retval = http_error(
+          connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error");
         goto http_response_lua_unlock;
     }
 
@@ -196,7 +201,8 @@ http_answer(void* cls,
                 "Invalid response 'code' field - expected integer, got %s\n",
                 lua_typename(L, lua_type(L, -1)));
         lua_pop(L, 2);
-        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        retval = http_error(
+          connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error");
         goto http_response_lua_unlock;
     }
 
@@ -212,7 +218,8 @@ http_answer(void* cls,
                 "Invalid response 'body' field - expected string, got %s\n",
                 lua_typename(L, lua_type(L, -1)));
         lua_pop(L, 2);
-        retval = http_error(connection, MHD_HTTP_INTERNAL_SERVER_ERROR, e500);
+        retval = http_error(
+          connection, MHD_HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error");
         goto http_response_lua_unlock;
     }
 
@@ -224,7 +231,9 @@ http_answer(void* cls,
     response = MHD_create_response_from_buffer(
       strlen(body), (void*)body, MHD_RESPMEM_PERSISTENT);
     MHD_add_response_header(
-      response, MHD_HTTP_HEADER_CONTENT_TYPE, "text/html");
+      response,
+      MHD_HTTP_HEADER_CONTENT_TYPE,
+      "text/html"); // TODO: detect mime type / get it from response table
 
     retval = MHD_queue_response(connection, status, response);
     MHD_destroy_response(response);
@@ -259,7 +268,7 @@ reload_lua(lua_State* L, const char* path)
 static void*
 watcher_thread(void* arg)
 {
-    struct watch_args* wa = arg;
+    struct server_cfg* wa = arg;
     int in_fd = inotify_init1(IN_NONBLOCK);
     if (in_fd < 0) {
         perror("inotify_init1");
@@ -267,7 +276,7 @@ watcher_thread(void* arg)
     }
 
     // Watch for writes + close (so temporary files don’t trigger)
-    int wd = inotify_add_watch(in_fd, wa->path, IN_CLOSE_WRITE);
+    int wd = inotify_add_watch(in_fd, wa->lua_cfg_path, IN_CLOSE_WRITE);
     if (wd < 0) {
         perror("inotify_add_watch");
         close(in_fd);
@@ -287,9 +296,9 @@ watcher_thread(void* arg)
             struct inotify_event* evt = (void*)ptr;
             if (evt->mask & IN_CLOSE_WRITE) {
                 // File was updated—reload
-                printf("%s updated - reloading...\n", wa->path);
+                printf("%s updated - reloading...\n", wa->lua_cfg_path);
                 pthread_mutex_lock(&luaLock);
-                reload_lua(L, wa->path);
+                reload_lua(L, wa->lua_cfg_path);
                 pthread_mutex_unlock(&luaLock);
             }
             ptr += sizeof(*evt) + evt->len;
@@ -307,19 +316,22 @@ usage(const char* prog)
 {
     fprintf(stderr,
             "Usage: %s [OPTIONS]\n"
-            "  -h, --help           Show this help\n"
-            "  -f, --lua FILE       Path to lua file\n",
+            "  -h, --help           Show this message\n"
+            "  -s, --static         Directory containing static files\n"
+            "  -f, --lua FILE       Path to lua config file\n",
             prog);
 }
 
 enum {
     ko_help = 256,
     ko_file,
+    ko_static,
 };
 
 static const ko_longopt_t longopts[] = {
     { "help", ko_no_argument, ko_help },
     { "lua", ko_required_argument, ko_file },
+    { "static", ko_required_argument, ko_file },
     { NULL, 0, 0 }
 };
 
@@ -332,10 +344,11 @@ main(int argc, char* argv[])
     }
 
     char* lua_file = NULL;
+    char* static_dir = NULL;
 
     ketopt_t s = KETOPT_INIT;
     int c;
-    const char* ostr = "hf:";
+    const char* ostr = "hf:s:";
 
     while ((c = ketopt(&s, argc, argv, true, ostr, longopts)) != -1) {
         switch (c) {
@@ -347,6 +360,11 @@ main(int argc, char* argv[])
             case 'f':
             case ko_file:
                 lua_file = s.arg;
+                break;
+
+            case 's':
+            case ko_static:
+                static_dir = s.arg;
                 break;
 
             case '?':
@@ -388,8 +406,9 @@ main(int argc, char* argv[])
     pthread_mutex_unlock(&luaLock);
 
     pthread_t tid;
-    struct watch_args wa = {
-        .path = lua_file,
+    struct server_cfg wa = {
+        .lua_cfg_path = lua_file,
+        .static_dir_path = static_dir,
     };
 
     if (pthread_create(&tid, NULL, watcher_thread, &wa) != 0) {
@@ -423,3 +442,12 @@ main(int argc, char* argv[])
 
     return 0;
 }
+
+// TODO: C pre-dispatch "middleware" for static file streaming
+// TODO: Expose some kind of API to lua script (ex. mime_type_for(path),
+// send_file(path), etc.)
+// TODO: Add more response fields (Headers, Cookies, etc.)
+// TODO: Parse URL queries before passing URL to lua; Add query field to request
+// table.
+// TODO: Allow for url-params somehow? (as in /user/<id>)
+// TODO: Make some parameters in response table optional

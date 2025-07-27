@@ -35,4 +35,17 @@ routes = {
 			body = "<html>It's " .. os.date() .. "</html>",
 		}
 	end,
+	["/info"] = function(request)
+		if request.method == "GET" then
+			return {
+				code = 200,
+				body = "<h1>I love Hatsune Miku</h1>"
+			}
+		else
+			return {
+				code = 404,
+				body = "<h1>I HATE BALCEROWICZ</h1>"
+			}
+		end
+	end,
 }
